@@ -1,0 +1,20 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: technova-mysql-test
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: technova_test_db
+      MYSQL_USER: technova_user
+      MYSQL_PASSWORD: ${MYSQL_TEST_PASSWORD:?Set MYSQL_TEST_PASSWORD in your environment}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_TEST_ROOT_PASSWORD:?Set MYSQL_TEST_ROOT_PASSWORD in your environment}
+    volumes:
+      - technova_test_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  technova_test_mysql:

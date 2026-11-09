@@ -1,4 +1,3 @@
-@'
 
 # Environment secrets
 .env
@@ -32,6 +31,10 @@ coverage/
 backend/media/
 backend/staticfiles/
 
+# TiDB / SSL CA certificates (store locally; never commit private certs)
+# The public ISRG Root X1 cert is safe to commit but excluded here to
+# avoid confusion; use the path in DB_SSL_CA env var instead.
+backend/certs/*.pem
+
 # Logs
 *.log
-'@ | Add-Content .gitignore
