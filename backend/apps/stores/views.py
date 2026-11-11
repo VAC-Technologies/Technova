@@ -1,13 +1,16 @@
 
 from django.db import IntegrityError, transaction
-from django.db.models import Sum, F, Q
+import logging
+from django.db.models import Sum, F, Q, ProtectedError
+
+logger = logging.getLogger('apps.stores')
 from django.utils import timezone
 from datetime import timedelta
 from django.utils.text import slugify
 
 from rest_framework import viewsets
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .models import Store, Membership, Category, Product, Order
@@ -217,8 +220,22 @@ def product_detail(request, slug, pk):
         )
 
     if request.method == 'DELETE':
-        product.delete()
-        return Response(status=204)
+        try:
+            product.delete()
+            logger.info("Product '%s' (ID %s) deleted from store '%s'.", product.name, product.id, store.slug)
+            return Response(status=204)
+        except ProtectedError:
+            logger.warning(
+                "Attempted deletion of product '%s' (ID %s) blocked: product is referenced in historical orders.",
+                product.name,
+                product.id
+            )
+            return Response(
+                {
+                    'detail': 'Cannot delete product because it is referenced in existing orders. Consider deactivating it instead.'
+                },
+                status=409
+            )
 
     serializer = ProductSerializer(
         product,
@@ -298,7 +315,7 @@ def publish(request, slug):
 
     return Response({
         'slug': store.slug,
-        'url_path': '/' + store.slug,
+        'url_path': '/store/' + store.slug,
         'is_published': True
     })
 

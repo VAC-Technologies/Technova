@@ -59,3 +59,5 @@ def ai_chat(request):
     return Response({'answer': answer, 'store_slug': store.slug, 'evidence': facts})
 
 ai_chat.throttle_scope = 'ai_chat'
+if hasattr(ai_chat, 'cls'):
+    ai_chat.cls.throttle_scope = 'ai_chat'

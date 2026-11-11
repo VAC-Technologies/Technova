@@ -25,8 +25,22 @@ export function saveTokens(access: string, refresh: string) {
   localStorage.setItem('ss_access', access); localStorage.setItem('ss_refresh', refresh)
 }
 export function logout() {
+  const currentRefresh = refreshToken || localStorage.getItem('ss_refresh') || ''
+  const currentAccess = accessToken || localStorage.getItem('ss_access') || ''
   accessToken = ''; refreshToken = ''
   localStorage.removeItem('ss_access'); localStorage.removeItem('ss_refresh')
+  if (currentRefresh) {
+    fetch(`${API_BASE}/auth/logout/`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(currentAccess ? { 'Authorization': `Bearer ${currentAccess}` } : {})
+      },
+      body: JSON.stringify({ refresh: currentRefresh })
+    }).catch(() => {
+      // Best-effort server blacklist on logout
+    })
+  }
 }
 window.addEventListener('storage', event => {
   if (event.key === 'ss_access' || event.key === 'ss_refresh' || event.key === null) {

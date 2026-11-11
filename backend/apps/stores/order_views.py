@@ -12,10 +12,10 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
+from rest_framework.throttling import ScopedRateThrottle
 
 from .models import Order, OrderItem, OrderStatusHistory, Product, Store
 from .order_serializers import OrderReadSerializer
@@ -98,7 +98,7 @@ def validate_checkout(request):
     raw_items = data.get('items')
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > 180:
         return None, 'A customer name of 1 to 180 characters is required.'
-    if not isinstance(phone, str) or not re.fullmatch(r'\+?[0-9][0-9\s-]{7,20}', phone.strip()):
+    if not isinstance(phone, str) or not re.fullmatch(r'\+?[0-9][0-9\s\-]{7,20}', phone.strip()):
         return None, 'Enter a valid phone number.'
     if not isinstance(address, dict) or any(
         not isinstance(address.get(field), str) or not address[field].strip()
@@ -166,6 +166,7 @@ def checkout_config(request, slug):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([ScopedRateThrottle])
 def checkout(request, slug):
     store = Store.objects.filter(slug=slug, is_published=True).first()
     if not store:
@@ -243,6 +244,10 @@ def checkout(request, slug):
             return Response(order_payload(existing), status=200)
         return Response({'detail': 'Order could not be created safely; retry with a new request key.'}, status=409)
     return Response(order_payload(order), status=201)
+
+checkout.throttle_scope = 'checkout'
+if hasattr(checkout, 'cls'):
+    checkout.cls.throttle_scope = 'checkout'
 
 
 @api_view(['POST'])
@@ -375,7 +380,7 @@ def fail_payment(request, order_number):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def customer_orders(request):
-    orders = Order.objects.filter(customer=request.user, is_demo=False).prefetch_related('items', 'status_history').order_by('-created_at')
+    orders = Order.objects.filter(customer=request.user, is_demo=False).select_related('store').prefetch_related('items', 'status_history').order_by('-created_at')
     return Response(OrderReadSerializer(orders, many=True).data)
 
 
@@ -474,3 +479,192 @@ def collect_cod_payment(request, slug, order_number):
             return Response(order_payload(order))
     except Order.DoesNotExist:
         return Response({'detail': 'Order not found.'}, status=404)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def razorpay_webhook(request):
+    """
+    Asynchronous Razorpay webhook confirmation endpoint.
+    Verifies HMAC SHA-256 signature using the raw request body.
+    Processes payment.captured, order.paid, payment.failed idempotently.
+    """
+    secret = settings.RAZORPAY_WEBHOOK_SECRET
+    if not secret:
+        logger.error("Razorpay webhook received but RAZORPAY_WEBHOOK_SECRET is not configured.")
+        return Response({'detail': 'Webhook secret is not configured on the server.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    signature = request.headers.get('X-Razorpay-Signature', '').strip()
+    if not signature:
+        logger.warning("Razorpay webhook received without X-Razorpay-Signature header.")
+        return Response({'detail': 'Missing webhook signature header.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    raw_body = request.body
+    computed_signature = hmac.new(secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(computed_signature, signature):
+        logger.warning("Razorpay webhook signature verification failed.")
+        return Response({'detail': 'Invalid webhook signature.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        event_payload = json.loads(raw_body.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("Razorpay webhook payload could not be parsed as JSON.")
+        return Response({'detail': 'Malformed JSON payload.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    event = event_payload.get('event')
+    if not event or not isinstance(event, str):
+        return Response({'detail': 'Event name missing from payload.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    payload_data = event_payload.get('payload', {})
+    if not isinstance(payload_data, dict):
+        return Response({'detail': 'Malformed payload container.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    payment_entity = payload_data.get('payment', {}).get('entity', {})
+    order_entity = payload_data.get('order', {}).get('entity', {})
+
+    payment_id = payment_entity.get('id')
+    provider_order_id = payment_entity.get('order_id') or order_entity.get('id')
+    receipt = order_entity.get('receipt') or payment_entity.get('notes', {}).get('order_number')
+
+    if not provider_order_id and not receipt:
+        logger.warning("Razorpay webhook event '%s' lacks order identifiers.", event)
+        return Response({'detail': 'Missing order identification in webhook event.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        order_qs = Order.objects.select_for_update()
+        order = None
+        if provider_order_id:
+            order = order_qs.filter(razorpay_order_id=provider_order_id).first()
+        if not order and receipt:
+            order = order_qs.filter(order_number=receipt).first()
+
+        if not order:
+            logger.warning("Razorpay webhook event '%s' references unknown order (%s / %s).", event, provider_order_id, receipt)
+            return Response({'detail': 'Referenced order not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # FIX 3: Razorpay Order ID Validation
+        # Whenever both incoming provider_order_id and order.razorpay_order_id exist, they must match.
+        if provider_order_id and order.razorpay_order_id and order.razorpay_order_id != provider_order_id:
+            logger.error(
+                "Razorpay webhook order_id mismatch for order %s: payload order_id '%s' != Order.razorpay_order_id '%s'",
+                order.order_number, provider_order_id, order.razorpay_order_id
+            )
+            return Response({'detail': 'Provider order ID mismatch.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Payment captured / order paid
+        if event in ('payment.captured', 'order.paid'):
+            # FIX 4: Amount and Currency Validation
+            # Extract amount and currency from payment entity, falling back to order entity
+            event_amount = payment_entity.get('amount')
+            if event_amount is None:
+                event_amount = order_entity.get('amount')
+
+            event_currency = payment_entity.get('currency')
+            if not event_currency:
+                event_currency = order_entity.get('currency')
+            event_currency = (event_currency or '').upper()
+
+            expected_amount = int(order.total * 100)
+            expected_currency = order.currency.upper()
+
+            # Ensure financial data is not missing
+            if event_amount is None:
+                logger.error("Razorpay webhook event '%s' for order %s is missing payment amount.", event, order.order_number)
+                return Response({'detail': 'Payment amount missing from webhook payload.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not event_currency:
+                logger.error("Razorpay webhook event '%s' for order %s is missing payment currency.", event, order.order_number)
+                return Response({'detail': 'Payment currency missing from webhook payload.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Validate amount and currency against DB order values
+            if event_amount != expected_amount:
+                logger.error(
+                    "Payment amount mismatch for order %s: expected %s, got %s",
+                    order.order_number, expected_amount, event_amount
+                )
+                return Response({'detail': 'Payment amount does not match order total.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if event_currency != expected_currency:
+                logger.error(
+                    "Payment currency mismatch for order %s: expected %s, got %s",
+                    order.order_number, expected_currency, event_currency
+                )
+                return Response({'detail': 'Payment currency does not match order currency.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # FIX 2: Payment ID Recording & Idempotency
+            # If order is already marked PAID, ensure payment ID is recorded if previously missing
+            if order.payment_status == Order.PaymentStatus.PAID:
+                if payment_id and not order.razorpay_payment_id:
+                    order.razorpay_payment_id = payment_id
+                    order.save(update_fields=['razorpay_payment_id', 'updated_at'])
+                    logger.info("Recorded missing payment ID %s for already-paid order %s.", payment_id, order.order_number)
+                else:
+                    logger.info("Order %s already marked as PAID; idempotent return.", order.order_number)
+                return Response({'detail': 'Order is already marked as paid.', 'order_number': order.order_number}, status=status.HTTP_200_OK)
+
+            # Order cancelled prior to capture
+            if order.status == Order.Status.CANCELLED:
+                logger.critical(
+                    "Payment captured for cancelled order %s! Payment ID: %s",
+                    order.order_number, payment_id
+                )
+                order.razorpay_payment_id = payment_id or order.razorpay_payment_id
+                order.payment_status = Order.PaymentStatus.PAID
+                order.save(update_fields=['razorpay_payment_id', 'payment_status', 'updated_at'])
+                OrderStatusHistory.objects.create(
+                    order=order,
+                    from_status=order.status,
+                    to_status=order.status,
+                    note=f'Payment {payment_id} captured after cancellation'
+                )
+                return Response({'detail': 'Order was previously cancelled; payment recorded for review.', 'order_number': order.order_number}, status=status.HTTP_200_OK)
+
+            # Normal success
+            if payment_id:
+                order.razorpay_payment_id = payment_id
+            order.payment_status = Order.PaymentStatus.PAID
+            old_status = order.status
+            if order.status == Order.Status.PLACED:
+                order.status = Order.Status.CONFIRMED
+                OrderStatusHistory.objects.create(
+                    order=order,
+                    from_status=old_status,
+                    to_status=Order.Status.CONFIRMED,
+                    note='Confirmed via Razorpay webhook'
+                )
+
+            # Inventory was already reserved at checkout; do not double-deduct
+            order.save(update_fields=['razorpay_payment_id', 'payment_status', 'status', 'updated_at'])
+            logger.info("Order %s confirmed and marked PAID via webhook.", order.order_number)
+            return Response({'detail': 'Payment recorded successfully.', 'order_number': order.order_number}, status=status.HTTP_200_OK)
+
+        # 2. Payment failed
+        # FIX 1: Payment Retry and Inventory Safety
+        # In Razorpay, payment.failed denotes an individual payment attempt failure, not an order failure.
+        # Customer can retry another card/UPI on the same order. Do NOT release stock or mark order FAILED.
+        elif event == 'payment.failed':
+            if order.payment_status in (Order.PaymentStatus.PAID, Order.PaymentStatus.AUTHORIZED):
+                logger.warning("Received payment.failed for already paid order %s; ignoring.", order.order_number)
+                return Response({'detail': 'Order already paid; ignoring failure event.', 'order_number': order.order_number}, status=status.HTTP_200_OK)
+
+            # Record attempt failure in audit log; keep stock reserved for customer retry
+            error_desc = payment_entity.get('error_description') or 'Payment attempt failed'
+            logger.warning(
+                "Payment attempt %s failed for order %s: %s. Keeping stock reserved for retry.",
+                payment_id, order.order_number, error_desc
+            )
+            OrderStatusHistory.objects.create(
+                order=order,
+                from_status=order.status,
+                to_status=order.status,
+                note=f"Payment attempt {payment_id or '<unknown>'} failed ({error_desc[:100]}); awaiting retry or expiry."
+            )
+            return Response({
+                'detail': 'Payment attempt failure acknowledged; order remains open for retry.',
+                'order_number': order.order_number
+            }, status=status.HTTP_200_OK)
+
+        # 3. Other events acknowledged safely
+        else:
+            logger.info("Acknowledged Razorpay webhook event '%s' for order %s.", event, order.order_number)
+            return Response({'detail': f"Event '{event}' acknowledged.", 'order_number': order.order_number}, status=status.HTTP_200_OK)

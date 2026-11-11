@@ -38,3 +38,6 @@ backend/certs/*.pem
 
 # Logs
 *.log
+
+# Local development settings
+backend/config/settings_local.py

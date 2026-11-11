@@ -11,14 +11,18 @@ from rest_framework.test import APITestCase
 from rest_framework import status
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from google.genai.errors import ServerError
+import json
 import hashlib
 import hmac
 import uuid
 from unittest.mock import Mock
 from .models import Store, Membership, Product, Category, Order, OrderItem
 
+from django.core.cache import cache
+
 class TenantIsolationTests(APITestCase):
     def setUp(self):
+        cache.clear()
         User=get_user_model()
         self.owner=User.objects.create_user(username='one',email='one@example.com',password='long-test-password')
         self.other=User.objects.create_user(username='two',email='two@example.com',password='long-test-password')
@@ -76,12 +80,36 @@ class TenantIsolationTests(APITestCase):
         self.assertEqual(response.status_code,status.HTTP_401_UNAUTHORIZED)
 
     def test_public_store_requires_published_flag(self):
-        hidden=self.client.get('/api/public/stores/one-shop/')
-        self.assertEqual(hidden.status_code,status.HTTP_404_NOT_FOUND)
-        self.store.is_published=True; self.store.save(update_fields=['is_published'])
-        public=self.client.get('/api/public/stores/one-shop/')
-        self.assertEqual(public.status_code,status.HTTP_200_OK)
-        self.assertNotIn('owner',public.data)
+        # 1. Unpublished store: Anonymous request is rejected with 404
+        self.client.force_authenticate(user=None)
+        unauth = self.client.get('/api/public/stores/one-shop/')
+        self.assertEqual(unauth.status_code, status.HTTP_404_NOT_FOUND)
+
+        # 2. Authenticated user on unpublished store also gets 404
+        self.client.force_authenticate(self.owner)
+        hidden = self.client.get('/api/public/stores/one-shop/')
+        self.assertEqual(hidden.status_code, status.HTTP_404_NOT_FOUND)
+
+        # 3. Published store: Anonymous customer can view published store without exposing owner
+        self.store.is_published = True
+        self.store.save(update_fields=['is_published'])
+        self.client.force_authenticate(user=None)
+        public = self.client.get('/api/public/stores/one-shop/')
+        self.assertEqual(public.status_code, status.HTTP_200_OK)
+        self.assertNotIn('owner', public.data)
+        self.assertEqual(public.data['name'], 'One Shop')
+
+        # 4. Anonymous customer can view checkout config
+        cfg = self.client.get('/api/public/stores/one-shop/checkout/config/')
+        self.assertEqual(cfg.status_code, status.HTTP_200_OK)
+
+        # 5. Anonymous customer CANNOT checkout without authentication
+        anon_checkout = self.client.post('/api/public/stores/one-shop/checkout/', {}, format='json')
+        self.assertEqual(anon_checkout.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 6. Anonymous customer CANNOT access private merchant endpoints
+        private_res = self.client.get('/api/stores/one-shop/products/')
+        self.assertEqual(private_res.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_store_create_and_private_route_require_authenticated_owner(self):
         login=self.client.post('/api/auth/login/',{'email':self.owner.email,'password':'long-test-password'},format='json')
@@ -102,6 +130,7 @@ class TenantIsolationTests(APITestCase):
         self.assertEqual(self.store.slug,'one-shop')
 
     def test_public_store_does_not_include_products_from_other_tenants(self):
+        self.client.force_authenticate(self.owner)
         self.store.is_published=True
         self.store.save(update_fields=['is_published'])
         self.product.sku='PRIVATE-SKU'
@@ -118,6 +147,7 @@ class TenantIsolationTests(APITestCase):
         self.assertNotIn('owner',response.data)
 
     def test_invalid_or_unpublished_public_store_url_returns_not_found(self):
+        self.client.force_authenticate(self.owner)
         self.store.is_published=False
         self.store.save(update_fields=['is_published'])
         self.assertEqual(self.client.get('/api/public/stores/missing-store/').status_code,status.HTTP_404_NOT_FOUND)
@@ -132,8 +162,11 @@ class TenantIsolationTests(APITestCase):
 
     def test_public_product_detail_only_serves_active_real_products(self):
         self.store.is_published=True; self.store.save(update_fields=['is_published'])
+        self.client.force_authenticate(user=None)
+        # Unauthenticated request to active product of published store succeeds
         response=self.client.get(f'/api/public/stores/one-shop/products/{self.product.id}/')
         self.assertEqual(response.status_code,status.HTTP_200_OK)
+        self.assertEqual(response.data['name'], self.product.name)
         demo=Product.objects.create(store=self.store,name='Demo',price='2.00',stock=1,is_demo=True)
         public_store=self.client.get('/api/public/stores/one-shop/')
         self.assertNotIn(demo.id,[item['id'] for item in public_store.data['products']])
@@ -151,6 +184,7 @@ class TenantIsolationTests(APITestCase):
         self.assertEqual(self.store.theme_settings['font_family'],'Georgia, serif')
         published=self.client.post('/api/stores/one-shop/publish/',{},format='json')
         self.assertEqual(published.status_code,status.HTTP_200_OK)
+        self.assertEqual(published.data['url_path'], '/store/one-shop')
         self.store.refresh_from_db(); self.assertTrue(self.store.is_published)
 
     def test_product_create_rejects_zero_price_and_allows_repeated_blank_sku(self):
@@ -162,10 +196,39 @@ class TenantIsolationTests(APITestCase):
             self.assertEqual(response.status_code,status.HTTP_201_CREATED)
         self.assertEqual(Product.objects.filter(store=self.store,name__startswith='No SKU').count(),2)
 
-    def test_slug_availability_is_public_but_does_not_expose_store_data(self):
+    def test_slug_availability_requires_authentication_and_reports_correctly(self):
+        # Unauthenticated request returns 401
+        unauth = self.client.get('/api/stores/slug-availability/', {'slug':'one-shop'})
+        self.assertEqual(unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.client.force_authenticate(self.owner)
         response=self.client.get('/api/stores/slug-availability/',{'slug':'one-shop'})
         self.assertEqual(response.status_code,status.HTTP_200_OK)
         self.assertEqual(response.data,{'slug':'one-shop','available':False})
+
+    def test_registration_password_validators_enforced(self):
+        # Common numeric password rejected
+        res = self.client.post('/api/auth/register/', {
+            'username': 'newuser1',
+            'email': 'newuser1@example.com',
+            'password': '12345678'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('password', res.data)
+
+        # Strong valid password accepted
+        good = self.client.post('/api/auth/register/', {
+            'username': 'newuser2',
+            'email': 'newuser2@example.com',
+            'password': 'ValidP@ssword2026!'
+        }, format='json')
+        self.assertEqual(good.status_code, status.HTTP_201_CREATED)
+
+    def test_auth_login_rate_limiting(self):
+        for _ in range(10):
+            res = self.client.post('/api/auth/login/', {'email': 'nobody@example.com', 'password': 'wrong'}, format='json')
+            self.assertIn(res.status_code, (status.HTTP_400_BAD_REQUEST, status.HTTP_401_UNAUTHORIZED))
+        throttled = self.client.post('/api/auth/login/', {'email': 'nobody@example.com', 'password': 'wrong'}, format='json')
+        self.assertEqual(throttled.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
 class InventoryAssistantTests(APITestCase):
     def setUp(self):
@@ -346,6 +409,7 @@ class ProductImportTests(APITestCase):
 
 class CheckoutOrderTests(APITestCase):
     def setUp(self):
+        cache.clear()
         User=get_user_model()
         self.customer=User.objects.create_user(username='buyer',email='buyer@example.com',password='long-test-password')
         self.owner=User.objects.create_user(username='seller',email='seller@example.com',password='long-test-password')
@@ -516,3 +580,678 @@ class CheckoutOrderTests(APITestCase):
         again=self.client.post(url,{},format='json')
         self.assertEqual(again.status_code,status.HTTP_409_CONFLICT)
         self.product.refresh_from_db(); self.assertEqual(self.product.stock,8)
+
+    def test_checkout_cors_options_preflight_allows_idempotency_key(self):
+        response = self.client.options(
+            '/api/public/stores/published-shop/checkout/',
+            HTTP_ORIGIN='http://localhost:5173',
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD='POST',
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS='content-type,idempotency-key,authorization',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), 'http://localhost:5173')
+        allowed_headers = [h.strip().lower() for h in response.headers.get('Access-Control-Allow-Headers', '').split(',')]
+        self.assertIn('idempotency-key', allowed_headers)
+
+    def test_checkout_phone_number_validation(self):
+        for valid_phone in ('+919876543210', '+91 98765-43210', '9876543210', '080-12345678'):
+            res, _ = self.checkout(extra={'customer_phone': valid_phone})
+            self.assertEqual(res.status_code, status.HTTP_201_CREATED, f"Failed for valid phone {valid_phone}")
+
+        for invalid_phone in ('123', 'not-a-number', '+', '   ', ''):
+            res, _ = self.checkout(extra={'customer_phone': invalid_phone})
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST, f"Accepted invalid phone {invalid_phone}")
+
+    def test_checkout_rate_limiting(self):
+        cache.clear()
+        self.product.stock = 100
+        self.product.save(update_fields=['stock'])
+        for i in range(10):
+            res, _ = self.checkout(key=str(uuid.uuid4()), quantity=1)
+            self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        throttled, _ = self.checkout(key=str(uuid.uuid4()), quantity=1)
+        self.assertEqual(throttled.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class Phase2ProductionHardeningTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username='phase2_user',
+            email='phase2@example.com',
+            password='Strong_Password_123!'
+        )
+        self.store = Store.objects.create(owner=self.user, name='Phase2 Store', slug='phase2-store')
+        Membership.objects.create(store=self.store, user=self.user, role='owner')
+
+    def test_jwt_token_rotation_and_revocation(self):
+        # 1. Login to obtain tokens
+        login_res = self.client.post('/api/auth/login/', {
+            'email': 'phase2@example.com',
+            'password': 'Strong_Password_123!'
+        }, format='json')
+        self.assertEqual(login_res.status_code, status.HTTP_200_OK)
+        access_1 = login_res.data['access']
+        refresh_1 = login_res.data['refresh']
+
+        # 2. Refresh token - rotates refresh token and blacklists refresh_1
+        refresh_res = self.client.post('/api/auth/refresh/', {
+            'refresh': refresh_1
+        }, format='json')
+        self.assertEqual(refresh_res.status_code, status.HTTP_200_OK)
+        self.assertIn('access', refresh_res.data)
+        self.assertIn('refresh', refresh_res.data)
+        refresh_2 = refresh_res.data['refresh']
+        self.assertNotEqual(refresh_1, refresh_2)
+
+        # 3. Attempting to reuse old refresh_1 must fail because it was blacklisted on rotation
+        reuse_res = self.client.post('/api/auth/refresh/', {
+            'refresh': refresh_1
+        }, format='json')
+        self.assertEqual(reuse_res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 4. Logout / Revoke refresh_2
+        logout_res = self.client.post('/api/auth/logout/', {
+            'refresh': refresh_2
+        }, format='json')
+        self.assertEqual(logout_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(logout_res.data.get('detail'), 'Successfully logged out.')
+
+        # 5. Attempting to use refresh_2 after logout must fail
+        post_logout_refresh = self.client.post('/api/auth/refresh/', {
+            'refresh': refresh_2
+        }, format='json')
+        self.assertEqual(post_logout_refresh.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 6. Attempting to logout with already blacklisted token must fail with 400
+        repeat_logout = self.client.post('/api/auth/logout/', {
+            'refresh': refresh_2
+        }, format='json')
+        self.assertEqual(repeat_logout.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 7. Calling logout with empty payload must return 400
+        empty_logout = self.client.post('/api/auth/logout/', {}, format='json')
+        self.assertEqual(empty_logout.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_product_deletion_unreferenced_succeeds(self):
+        product = Product.objects.create(
+            store=self.store,
+            name='Standalone Product',
+            price='15.00',
+            stock=10
+        )
+        self.client.force_authenticate(self.user)
+        response = self.client.delete(f'/api/stores/phase2-store/products/{product.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Product.objects.filter(id=product.id).exists())
+
+    def test_product_deletion_referenced_in_orders_returns_409_conflict(self):
+        product = Product.objects.create(
+            store=self.store,
+            name='Ordered Product',
+            price='25.00',
+            stock=10
+        )
+        order = Order.objects.create(
+            store=self.store,
+            order_number='ORD-PHASE2-001',
+            customer_name='Jane Customer',
+            customer_phone='5551234567',
+            total='50.00'
+        )
+        OrderItem.objects.create(
+            order=order,
+            product=product,
+            name=product.name,
+            quantity=2,
+            unit_price='25.00'
+        )
+
+        self.client.force_authenticate(self.user)
+        response = self.client.delete(f'/api/stores/phase2-store/products/{product.id}/')
+
+        # Must return 409 Conflict
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('referenced in existing orders', response.data.get('detail', ''))
+
+        # Historical order and product records must remain intact
+        self.assertTrue(Product.objects.filter(id=product.id).exists())
+        self.assertTrue(OrderItem.objects.filter(order=order, product=product).exists())
+        self.assertTrue(Order.objects.filter(id=order.id).exists())
+
+    def test_auth_logging_events_recorded_without_sensitive_data(self):
+        import logging
+        from io import StringIO
+
+        log_output = StringIO()
+        handler = logging.StreamHandler(log_output)
+        auth_logger = logging.getLogger('apps.accounts.auth')
+        auth_logger.addHandler(handler)
+        auth_logger.setLevel(logging.INFO)
+
+        try:
+            # Failed login attempt
+            self.client.post('/api/auth/login/', {
+                'email': 'phase2@example.com',
+                'password': 'WrongPassword123!'
+            }, format='json')
+
+            logs = log_output.getvalue()
+            self.assertIn("Failed login attempt for user 'phase2@example.com'", logs)
+            self.assertNotIn("WrongPassword123!", logs)
+
+            # Successful login
+            self.client.post('/api/auth/login/', {
+                'email': 'phase2@example.com',
+                'password': 'Strong_Password_123!'
+            }, format='json')
+
+            logs = log_output.getvalue()
+            self.assertIn("Successful login for user 'phase2@example.com'", logs)
+            self.assertNotIn("Strong_Password_123!", logs)
+        finally:
+            auth_logger.removeHandler(handler)
+    def test_security_settings_for_render_production(self):
+        from django.conf import settings
+        # Verify production logging is configured
+        self.assertIn('LOGGING', dir(settings))
+        self.assertIn('console', settings.LOGGING.get('handlers', {}))
+        self.assertIn('apps', settings.LOGGING.get('loggers', {}))
+
+        # Verify SimpleJWT token blacklisting configuration
+        self.assertTrue(settings.SIMPLE_JWT.get('ROTATE_REFRESH_TOKENS'))
+        self.assertTrue(settings.SIMPLE_JWT.get('BLACKLIST_AFTER_ROTATION'))
+        self.assertIn('rest_framework_simplejwt.token_blacklist', settings.INSTALLED_APPS)
+
+
+class RazorpayWebhookTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username='webhook_user',
+            email='webhook@example.com',
+            password='Strong_Password_123!'
+        )
+        self.store = Store.objects.create(owner=self.user, name='Webhook Store', slug='webhook-store')
+        Membership.objects.create(store=self.store, user=self.user, role='owner')
+        self.product = Product.objects.create(
+            store=self.store,
+            name='Webhook Product',
+            price='50.00',
+            stock=10
+        )
+        self.order = Order.objects.create(
+            store=self.store,
+            customer=self.user,
+            order_number='ORD-WH-001',
+            status=Order.Status.PLACED,
+            payment_method=Order.PaymentMethod.RAZORPAY,
+            payment_status=Order.PaymentStatus.PENDING,
+            total='50.00',
+            currency='INR',
+            stock_reserved=True,
+            razorpay_order_id='order_webhook_12345'
+        )
+        OrderItem.objects.create(
+            order=self.order,
+            product=self.product,
+            name=self.product.name,
+            quantity=1,
+            unit_price='50.00'
+        )
+        self.webhook_secret = 'test_webhook_secret_key_98765'
+
+    def _sign_payload(self, body_bytes, secret=None):
+        secret = secret or self.webhook_secret
+        return hmac.new(secret.encode('utf-8'), body_bytes, hashlib.sha256).hexdigest()
+
+    def test_webhook_missing_server_secret(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=''):
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=b'{}',
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE='any'
+            )
+            self.assertEqual(res.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def test_webhook_missing_signature_header(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=b'{}',
+                content_type='application/json'
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Missing webhook signature', res.data.get('detail', ''))
+
+    def test_webhook_invalid_signature_header(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=b'{"event": "payment.captured"}',
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE='tampered_signature_12345'
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Invalid webhook signature', res.data.get('detail', ''))
+
+    def test_webhook_malformed_json_payload(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            body = b'not a valid json string'
+            sig = self._sign_payload(body)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=body,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Malformed JSON payload', res.data.get('detail', ''))
+
+    def test_webhook_unknown_order(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_unknown_999",
+                            "order_id": "order_unknown_999",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_webhook_payment_captured_success_and_idempotency(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_wh_test_111",
+                            "order_id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+
+            # 1. First webhook call: Process payment successfully
+            res1 = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res1.status_code, status.HTTP_200_OK)
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PAID)
+            self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+            self.assertEqual(self.order.razorpay_payment_id, "pay_wh_test_111")
+            # Stock was already reserved; stock must NOT be deducted again
+            self.product.refresh_from_db()
+            self.assertEqual(self.product.stock, 10)
+
+            # 2. Duplicate webhook call: Idempotent return (zero duplicate side-effects)
+            res2 = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res2.status_code, status.HTTP_200_OK)
+            self.assertIn("already marked as paid", res2.data.get('detail', ''))
+            self.product.refresh_from_db()
+            self.assertEqual(self.product.stock, 10)
+
+    def test_webhook_payment_amount_mismatch_rejected(self):
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_tampered_amount",
+                            "order_id": "order_webhook_12345",
+                            "amount": 100,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("amount does not match", res.data.get('detail', ''))
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+
+    def test_webhook_payment_failed_followed_by_payment_captured(self):
+        """Fix 1: payment.failed preserves reserved stock; subsequent captured attempt marks order paid."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            # 1. First payment attempt fails
+            fail_payload = json.dumps({
+                "entity": "event",
+                "event": "payment.failed",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_fail_attempt_1",
+                            "order_id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR",
+                            "error_description": "Card expired"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            res_fail = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=fail_payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=self._sign_payload(fail_payload)
+            )
+            self.assertEqual(res_fail.status_code, status.HTTP_200_OK)
+            self.assertIn("remains open for retry", res_fail.data.get('detail', ''))
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+            self.assertTrue(self.order.stock_reserved)
+            self.product.refresh_from_db()
+            self.assertEqual(self.product.stock, 10)  # Stock still reserved, not released!
+
+            # 2. Subsequent payment attempt succeeds
+            success_payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_success_attempt_2",
+                            "order_id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            res_succ = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=success_payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=self._sign_payload(success_payload)
+            )
+            self.assertEqual(res_succ.status_code, status.HTTP_200_OK)
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PAID)
+            self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+            self.assertEqual(self.order.razorpay_payment_id, "pay_success_attempt_2")
+            self.product.refresh_from_db()
+            self.assertEqual(self.product.stock, 10)  # Stock not double-deducted
+
+    def test_webhook_duplicate_payment_failed_events_no_stock_release(self):
+        """Fix 1: Multiple payment.failed attempts never release stock."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.failed",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_fail_dup_1",
+                            "order_id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+
+            for _ in range(3):
+                res = self.client.post(
+                    '/api/payments/razorpay/webhook/',
+                    data=payload,
+                    content_type='application/json',
+                    HTTP_X_RAZORPAY_SIGNATURE=sig
+                )
+                self.assertEqual(res.status_code, status.HTTP_200_OK)
+                self.order.refresh_from_db()
+                self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+                self.assertTrue(self.order.stock_reserved)
+                self.product.refresh_from_db()
+                self.assertEqual(self.product.stock, 10)
+
+    def test_webhook_order_paid_followed_by_payment_captured_records_payment_id(self):
+        """Fix 2: order.paid sets status to PAID; later payment.captured records missing payment_id."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            # 1. order.paid event arrives first without payment_id
+            order_paid_payload = json.dumps({
+                "entity": "event",
+                "event": "order.paid",
+                "payload": {
+                    "order": {
+                        "entity": {
+                            "id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR",
+                            "receipt": "ORD-WH-001"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            res1 = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=order_paid_payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=self._sign_payload(order_paid_payload)
+            )
+            self.assertEqual(res1.status_code, status.HTTP_200_OK)
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PAID)
+            self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+            self.assertIsNone(self.order.razorpay_payment_id)
+
+            # 2. payment.captured arrives next with payment id
+            pay_captured_payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_late_capture_777",
+                            "order_id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            res2 = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=pay_captured_payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=self._sign_payload(pay_captured_payload)
+            )
+            self.assertEqual(res2.status_code, status.HTTP_200_OK)
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PAID)
+            self.assertEqual(self.order.razorpay_payment_id, "pay_late_capture_777")
+            self.product.refresh_from_db()
+            self.assertEqual(self.product.stock, 10)  # Stock not double-deducted
+
+    def test_webhook_receipt_fallback_mismatched_provider_order_id_rejected(self):
+        """Fix 3: Receipt matches order, but incoming provider_order_id conflicts with order's provider id."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_fraud_mismatch",
+                            "order_id": "order_foreign_99999",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    },
+                    "order": {
+                        "entity": {
+                            "id": "order_foreign_99999",
+                            "receipt": "ORD-WH-001"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("Provider order ID mismatch", res.data.get('detail', ''))
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+            self.assertEqual(self.order.razorpay_order_id, "order_webhook_12345")
+
+    def test_webhook_order_paid_amount_mismatch_rejected(self):
+        """Fix 4: order.paid amount differs from local order total."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "order.paid",
+                "payload": {
+                    "order": {
+                        "entity": {
+                            "id": "order_webhook_12345",
+                            "amount": 9999,  # Mismatch: 99.99 instead of 50.00 (5000 paise)
+                            "currency": "INR",
+                            "receipt": "ORD-WH-001"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("amount does not match", res.data.get('detail', ''))
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+
+    def test_webhook_order_paid_currency_mismatch_rejected(self):
+        """Fix 4: order.paid currency differs from local order currency."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "order.paid",
+                "payload": {
+                    "order": {
+                        "entity": {
+                            "id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "USD",  # Mismatch: USD instead of INR
+                            "receipt": "ORD-WH-001"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("currency does not match", res.data.get('detail', ''))
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+
+    def test_webhook_missing_amount_and_currency_rejected(self):
+        """Fix 4: Payload has no financial values at all."""
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.captured",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_no_amount",
+                            "order_id": "order_webhook_12345"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("Payment amount missing", res.data.get('detail', ''))
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PENDING)
+
+    def test_webhook_payment_failed_does_not_override_paid_order(self):
+        self.order.payment_status = Order.PaymentStatus.PAID
+        self.order.status = Order.Status.CONFIRMED
+        self.order.save()
+
+        with override_settings(RAZORPAY_WEBHOOK_SECRET=self.webhook_secret):
+            payload = json.dumps({
+                "entity": "event",
+                "event": "payment.failed",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_wh_late_fail",
+                            "order_id": "order_webhook_12345",
+                            "amount": 5000,
+                            "currency": "INR"
+                        }
+                    }
+                }
+            }).encode('utf-8')
+            sig = self._sign_payload(payload)
+            res = self.client.post(
+                '/api/payments/razorpay/webhook/',
+                data=payload,
+                content_type='application/json',
+                HTTP_X_RAZORPAY_SIGNATURE=sig
+            )
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.order.refresh_from_db()
+            self.assertEqual(self.order.payment_status, Order.PaymentStatus.PAID)
+            self.assertEqual(self.order.status, Order.Status.CONFIRMED)
